@@ -125,9 +125,9 @@ int main(int argc, char* argv[])
     } else {
         // Unknown extension: try TIFF first (most common large-image format),
         // then RAW camera, then DICOM without preamble (rare legacy ACR-NEMA).
-        ok = encode_tiff_to_png(input, output, cfg);
+        ok = encode_dicom_to_png(input, output, cfg);
         if (!ok) ok = encode_raw_to_png(input, output, cfg);
-        if (!ok) ok = encode_dicom_to_png(input, output, cfg);
+        if (!ok) ok = encode_tiff_to_png(input, output, cfg);
     }
 
     if (!ok) {

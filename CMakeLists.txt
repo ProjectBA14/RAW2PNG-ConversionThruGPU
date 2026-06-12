@@ -3,8 +3,7 @@ project(gpu_png_encoder LANGUAGES CXX CUDA)
 
 # ---------------------------------------------------------------------------
 # Language standards
-# C++17 is required by DCMTK. CUDA 11.8 supports C++17 for both host and
-# device code on SM 3.5. Setting both here ensures consistency.
+# C++17 is required by DCMTK. CUDA 11.8 supports C++17 for SM 3.5.
 # ---------------------------------------------------------------------------
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,25 +17,34 @@ set(CMAKE_CUDA_ARCHITECTURES 35)
 # ---------------------------------------------------------------------------
 # Dependencies
 # ---------------------------------------------------------------------------
-find_package(PNG    REQUIRED)
-find_package(TIFF   REQUIRED)
-find_package(ZLIB   REQUIRED)
-find_package(libraw CONFIG REQUIRED)
-find_package(DCMTK  CONFIG REQUIRED)
+find_package(PNG     REQUIRED)
+find_package(TIFF    REQUIRED)
+find_package(ZLIB    REQUIRED)
+find_package(libraw  CONFIG REQUIRED)
+find_package(DCMTK   CONFIG REQUIRED)
+
+# OpenJPEG is required for JPEG2000 DICOM decode.
+# vcpkg installs it as target 'openjp2' via OpenJPEGConfig.cmake.
+find_package(OpenJPEG CONFIG REQUIRED)
+
+# Resolve the OpenJPEG link target (cmake name differs across OPJ versions).
+# OpenJPEG 2.x exports 'openjp2'; some patched builds use 'OpenJPEG::openjp2'.
+if(TARGET openjp2)
+    set(_OPENJP2_TARGET openjp2)
+elseif(TARGET OpenJPEG::openjp2)
+    set(_OPENJP2_TARGET OpenJPEG::openjp2)
+else()
+    message(FATAL_ERROR
+        "OpenJPEG found but no known cmake target (openjp2 / OpenJPEG::openjp2). "
+        "Check your vcpkg OpenJPEG installation.")
+endif()
+message(STATUS "OpenJPEG target: ${_OPENJP2_TARGET}  version ${OpenJPEG_VERSION}")
 
 # ---------------------------------------------------------------------------
-# dicom_lib — pure C++ static library that owns all DCMTK interaction.
+# dicom_lib — pure C++ static library that owns all DCMTK/OpenJPEG interaction.
 #
-# Linking DCMTK as PRIVATE here is the key architectural decision:
-#   - DCMTK's INTERFACE_COMPILE_OPTIONS (including /Zc:__cplusplus) are NOT
-#     propagated to any consuming target.
-#   - This prevents MSVC-only flags from leaking into NVCC when the main
-#     executable (which has .cu sources) links against dicom_lib.
-#
-# This is the permanent fix for the nvcc fatal:
-#   "A single input file is required for a non-link phase when an output
-#    file is specified"
-# caused by /Zc:__cplusplus appearing in CUDA AdditionalOptions.
+# Linking DCMTK and OpenJPEG as PRIVATE isolates their INTERFACE_COMPILE_OPTIONS
+# (notably DCMTK's /Zc:__cplusplus) from gpu_png_encoder's CUDA compilation.
 # ---------------------------------------------------------------------------
 add_library(dicom_lib STATIC src/dicom_loader.cpp)
 
@@ -45,15 +53,17 @@ target_include_directories(dicom_lib PRIVATE
 
 target_compile_features(dicom_lib PRIVATE cxx_std_17)
 
-# PRIVATE: DCMTK's interface options stay inside dicom_lib, never reaching
-# gpu_png_encoder's CUDA compilation units.
 target_link_libraries(dicom_lib PRIVATE
     DCMTK::dcmdata
     DCMTK::ofstd
-    DCMTK::oflog)
+    DCMTK::oflog
+    DCMTK::dcmjpeg    # JPEG Baseline / Extended / Lossless
+    DCMTK::dcmjpls    # JPEG-LS
+    ${_OPENJP2_TARGET} # JPEG 2000 (decoded via OpenJPEG C API, not dcmjp2k)
+)
 
 # ---------------------------------------------------------------------------
-# Main executable — CUDA + C++ sources, NO direct DCMTK dependency
+# Main executable — CUDA + C++ sources, no direct DCMTK or OpenJPEG dependency
 # ---------------------------------------------------------------------------
 set(SOURCES
     src/main.cpp
@@ -76,14 +86,11 @@ target_link_libraries(gpu_png_encoder PRIVATE
     TIFF::TIFF
     ZLIB::ZLIB
     libraw::raw_r
-    dicom_lib           # includes DCMTK symbols; no INTERFACE leakage
+    dicom_lib       # includes DCMTK + OpenJPEG symbols; no INTERFACE flag leakage
 )
 
 # ---------------------------------------------------------------------------
 # NVCC flags
-# CMAKE_CUDA_ARCHITECTURES already emits -gencode arch=compute_35,code=sm_35.
-# Do NOT add -gencode manually or nvcc will warn about duplicates.
-# -Wno-deprecated-gpu-targets: suppress SM 3.5 deprecation noise (CUDA 11.x).
 # ---------------------------------------------------------------------------
 target_compile_options(gpu_png_encoder PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:

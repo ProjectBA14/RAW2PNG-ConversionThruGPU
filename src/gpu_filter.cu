@@ -1,17 +1,16 @@
 // gpu_filter.cu
 // PNG filter application + adaptive row-filter selection on SM 3.5 (GT 710).
 //
-// Three kernels:
-//   1. multi_filter_kernel  – computes all 5 PNG filters for every byte of
-//                             every row in the strip, in one pass.
-//   2. row_score_kernel     – for each (filter, row) pair sums |signed(byte)|
-//                             using a shared-memory tree reduction.
-//   3. select_assemble_kernel – picks the minimum-score filter per row and
-//                             writes [filter_byte | filtered_row] to output.
+// Two kernels:
+//   1. dicom_preprocess_kernel  – DICOM pixel transforms (optional, in-place)
+//   2. filter_select_kernel     – all 5 PNG filters scored in registers and
+//                                 the winner written to d_selected in one pass.
 //
-// All kernels require only global memory, shared memory, and __ldg().
-// No cooperative groups, no tensor cores, no warp-level primitives beyond
-// what SM 3.0+ guarantees.  Safe on SM 3.5 with CUDA 11.8.
+// The three-kernel design (multi_filter / row_score / select_assemble) has been
+// collapsed into filter_select_kernel.  This eliminates a 5× d_filtered global
+// write and read, cutting DDR3 memory traffic by ~3× on the GT 710.  Each block
+// handles one complete row; shared memory holds 5×256 uint32 score accumulators
+// (5 KB per block, well within the 48 KB SM 3.5 limit).
 
 #include "gpu_filter.h"
 
@@ -39,8 +38,6 @@
 struct GpuFilterContext {
     uint8_t*  d_input;      // [strip_height × width_bytes]
     uint8_t*  d_prior;      // [width_bytes]  – last row of previous strip
-    uint8_t*  d_filtered;   // [5 × strip_height × width_bytes]
-    uint32_t* d_scores;     // [5 × strip_height]
     uint8_t*  d_selected;   // [strip_height × (width_bytes + 1)]
     uint8_t*  h_output;     // pinned host mirror of d_selected
 
@@ -52,160 +49,263 @@ struct GpuFilterContext {
     cudaStream_t stream;
 
     // CUDA Events for per-call timing breakdown
-    cudaEvent_t ev_start;        // before H2D upload
-    cudaEvent_t ev_h2d_done;     // after H2D, before kernels
-    cudaEvent_t ev_kernels_done; // after all kernels + prior-row save
-    cudaEvent_t ev_d2h_done;     // after D2H download (= stream sync point)
+    cudaEvent_t ev_start;
+    cudaEvent_t ev_h2d_done;
+    cudaEvent_t ev_kernels_done;
+    cudaEvent_t ev_d2h_done;
 };
 
 // ---------------------------------------------------------------------------
-// Kernel 1 – multi_filter_kernel
+// DICOM pixel preprocessing kernel (in-place on d_input)
 //
-// Grid : (ceil(width_bytes/256), actual_rows, 1)
-// Block: (256, 1, 1)
+// Transforms raw little-endian DICOM samples to big-endian PNG-ready samples:
+//   1. bit-depth right-alignment (shift = HighBit − BitsStored + 1)
+//   2. sign extension for pixel_rep=1
+//   3. rescale slope / intercept (DICOM: applies to raw signed integer)
+//   4. window / level (DICOM PS 3.3 C.7.6.3.1.5 exact formula)
+//   5. byte-swap to big-endian (16-bit only)
 //
-// Indexing inside d_filtered: filter_id * strip_height * width_bytes + row *
-// width_bytes + byte_idx.  The strip_height dimension is used for indexing
-// even when actual_rows < strip_height; unused rows are never written.
+// One thread per sample.  NOT __restrict__ on d_inout: single pointer,
+// reads happen before writes for each thread (no intra-kernel aliasing).
 // ---------------------------------------------------------------------------
-__global__ void multi_filter_kernel(
+__global__ void dicom_preprocess_kernel(
+    uint8_t*     d_inout,
+    int          total_samples,
+    DicomPixelParams p)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_samples) return;
+
+    const uint8_t* d_in  = d_inout;
+    uint8_t*       d_out = d_inout;
+
+    const int out_maxval = (p.bits_allocated == 16) ? 65535 : 255;
+    float val;
+
+    if (p.bits_allocated == 16) {
+        // Read DICOM native (little-endian) 16-bit sample
+        uint16_t raw = (uint16_t)d_in[idx * 2]
+                     | ((uint16_t)d_in[idx * 2 + 1] << 8);
+
+        // Right-align: shift = HighBit − BitsStored + 1
+        //   Right-aligned (most scanners): HighBit=BitsStored-1 → shift=0 (no-op)
+        //   Left-aligned  (rare):          HighBit=BitsAllocated-1 → shift=BitsAllocated-BitsStored
+        int bit_shift = p.high_bit - p.bits_stored + 1;
+        if (bit_shift > 0) raw = (uint16_t)(raw >> bit_shift);
+
+        // Mask to exactly bits_stored bits — garbage in padding bits is real-world
+        if (p.bits_stored < 16) {
+            uint32_t mask = (1u << p.bits_stored) - 1u;
+            raw = (uint16_t)(raw & (uint16_t)mask);
+        }
+
+        if (p.pixel_rep == 1) {
+            // Two's complement sign extension; rescale applies to the signed value
+            int32_t sv;
+            if (p.bits_stored == 16) {
+                sv = (int32_t)(int16_t)raw;
+            } else {
+                int bits = p.bits_stored;
+                int half = 1 << (bits - 1);
+                sv = (int32_t)raw;
+                if (sv >= half) sv -= (1 << bits);
+            }
+            if (p.apply_rescale)
+                val = (float)sv * p.rescale_slope + p.rescale_intercept;
+            else
+                val = (float)sv;
+        } else {
+            val = (float)raw;
+            if (p.apply_rescale)
+                val = val * p.rescale_slope + p.rescale_intercept;
+        }
+    } else {
+        // 8-bit — respect pixel_rep for sign extension
+        if (p.pixel_rep == 1)
+            val = (float)(int8_t)d_in[idx];
+        else
+            val = (float)d_in[idx];
+        if (p.apply_rescale)
+            val = val * p.rescale_slope + p.rescale_intercept;
+    }
+
+    // DICOM PS 3.3 C.7.6.3.1.5 VOI window/level:
+    //   if (x - c + 0.5) <= -(w-1)/2  →  y = 0
+    //   if (x - c + 0.5) >   (w-1)/2  →  y = maxval
+    //   else y = ((x - c + 0.5) / (w-1) + 0.5) * maxval
+    if (p.apply_window) {
+        float wm1 = p.window_width - 1.0f;
+        float cen  = p.window_center;
+        if (wm1 <= 0.0f) {
+            val = (val >= cen) ? (float)out_maxval : 0.0f;
+        } else {
+            float lo = cen - wm1 * 0.5f - 0.5f;
+            float hi = cen + wm1 * 0.5f - 0.5f;
+            if (val <= lo)
+                val = 0.0f;
+            else if (val > hi)
+                val = (float)out_maxval;
+            else
+                val = ((val - cen + 0.5f) / wm1 + 0.5f) * (float)out_maxval;
+        }
+    }
+
+    val = fmaxf(0.f, fminf((float)out_maxval, val));
+    uint32_t ov = (uint32_t)val;
+
+    if (p.bits_allocated == 16) {
+        d_out[idx * 2]     = (uint8_t)(ov >> 8);    // big-endian MSB
+        d_out[idx * 2 + 1] = (uint8_t)(ov & 0xFF);  // big-endian LSB
+    } else {
+        d_out[idx] = (uint8_t)ov;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// filter_select_kernel — fused multi-filter + score + select
+//
+// Grid : (actual_rows, 1)   Block: (256, 1)
+//
+// One block handles one complete row.  All 5 PNG filter values are computed
+// in registers per byte, accumulated into per-thread score accumulators, then
+// reduced across the block in shared memory.  The winning filter is then
+// re-computed and written directly to d_selected — no d_filtered global buffer.
+//
+// Shared memory: 5 × 256 × 4 = 5120 bytes + 4 bytes = 5124 bytes per block.
+// SM 3.5: 48 KB → 9 blocks max from shared; 2048 threads → 8 blocks max →
+// effective occupancy: 8 blocks (100% thread occupancy, 50% block occupancy).
+//
+// Memory traffic vs. the old 3-kernel design:
+//   Old: multi_filter writes 5× strip, row_score reads 5× strip,
+//        select_assemble reads 1× strip and writes 1× strip  ≈ 12× strip_bytes
+//   New: 2 passes over d_input (score + write), 1 write to d_selected ≈ 3× strip_bytes
+// ---------------------------------------------------------------------------
+__global__ void filter_select_kernel(
     const uint8_t* __restrict__ d_input,
     const uint8_t* __restrict__ d_prior,
-    uint8_t*                    d_filtered,
+    uint8_t*                    d_selected,
     int                         width_bytes,
     int                         bpp,
-    int                         strip_height,  // allocated height (for strides)
     int                         actual_rows)
 {
-    const int byte_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int row_idx  = blockIdx.y;
-    if (byte_idx >= width_bytes || row_idx >= actual_rows) return;
+    const int row = blockIdx.x;
+    if (row >= actual_rows) return;
 
-    const int offset = row_idx * width_bytes + byte_idx;
+    // Pointer to the previous row (either d_prior for row 0 or d_input row-1).
+    // row > 0 is constant across all threads in a block (no warp divergence);
+    // the compiler hoists this pointer assignment out of both inner loops.
+    const uint8_t* prev_in = (row > 0)
+                           ? (d_input + (size_t)(row - 1) * width_bytes)
+                           : d_prior;
 
-    const uint8_t x = d_input[offset];
+    // -------------------------------------------------------------------------
+    // Pass 1: compute per-thread partial score sums for all 5 PNG filters
+    // -------------------------------------------------------------------------
+    uint32_t s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
 
-    // a = Sub predecessor  (left neighbour, same row)
-    const uint8_t a = (byte_idx >= bpp) ? d_input[offset - bpp] : 0;
+    for (int i = threadIdx.x; i < width_bytes; i += blockDim.x) {
+        const uint8_t x = d_input[(size_t)row * width_bytes + i];
+        const uint8_t a = (i >= bpp) ? d_input[(size_t)row * width_bytes + i - bpp] : 0;
+        const uint8_t b = prev_in[i];
+        const uint8_t c = (i >= bpp) ? prev_in[i - bpp] : 0;
 
-    // b = Up predecessor   (same column, previous row)
-    // Use __ldg for d_prior (read-only, SM 3.5 supports the L1 read-only path)
-    const uint8_t b = (row_idx == 0)
-        ? __ldg(d_prior + byte_idx)
-        : d_input[(row_idx - 1) * width_bytes + byte_idx];
+        const int pv  = (int)a + (int)b - (int)c;
+        const int pa  = abs(pv - (int)a);
+        const int pb  = abs(pv - (int)b);
+        const int pc  = abs(pv - (int)c);
+        const uint8_t paeth = (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
 
-    // c = Average/Paeth diagonal (previous row, left neighbour)
-    const uint8_t c = (row_idx == 0)
-        ? ((byte_idx >= bpp) ? __ldg(d_prior + byte_idx - bpp) : 0)
-        : ((byte_idx >= bpp) ? d_input[(row_idx - 1) * width_bytes + byte_idx - bpp] : 0);
+        // Compute all 5 candidates (uint8 arithmetic wraps mod 256 — PNG spec)
+        const uint8_t f0 = x;
+        const uint8_t f1 = x - a;
+        const uint8_t f2 = x - b;
+        const uint8_t f3 = x - (uint8_t)(((uint16_t)a + (uint16_t)b) >> 1);
+        const uint8_t f4 = x - paeth;
 
-    // Paeth predictor (PNG spec section 9.4)
-    const int p  = (int)a + (int)b - (int)c;
-    const int pa = abs(p - (int)a);
-    const int pb = abs(p - (int)b);
-    const int pc = abs(p - (int)c);
-    const uint8_t paeth = (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
-
-    // Write all 5 candidates.  uint8_t arithmetic wraps mod 256 – correct per PNG spec.
-    const int base = strip_height * width_bytes;
-    d_filtered[0 * base + offset] = x;          // None
-    d_filtered[1 * base + offset] = x - a;      // Sub
-    d_filtered[2 * base + offset] = x - b;      // Up
-    d_filtered[3 * base + offset] = x - (uint8_t)(((uint16_t)a + (uint16_t)b) >> 1); // Average
-    d_filtered[4 * base + offset] = x - paeth;  // Paeth
-}
-
-// ---------------------------------------------------------------------------
-// Kernel 2 – row_score_kernel
-//
-// Grid : (actual_rows, 5, 1)
-// Block: (256, 1, 1)
-//
-// Computes sum_of_abs_signed for one (row, filter) pair using a standard
-// shared-memory tree reduction.  No warp primitives – works on any SM >= 2.0.
-// ---------------------------------------------------------------------------
-__global__ void row_score_kernel(
-    const uint8_t* __restrict__ d_filtered,
-    uint32_t*                   d_scores,
-    int                         width_bytes,
-    int                         strip_height,
-    int                         actual_rows)
-{
-    const int row_idx    = blockIdx.x;
-    const int filter_id  = blockIdx.y;
-    if (row_idx >= actual_rows) return;
-
-    const int base   = filter_id * strip_height * width_bytes;
-    const uint8_t* row = d_filtered + base + row_idx * width_bytes;
-
-    __shared__ uint32_t sdata[256];
-
-    uint32_t local_sum = 0;
-    for (int i = threadIdx.x; i < width_bytes; i += 256) {
-        // |signed(byte)| = min(byte, 256 - byte)
-        uint8_t b = row[i];
-        local_sum += (b <= 128u) ? (uint32_t)b : (uint32_t)(256u - b);
+        // Byte cost = |signed byte| = min(v, 256-v)
+#define COST(v) ((v) <= 128u ? (uint32_t)(v) : (uint32_t)(256u - (v)))
+        s0 += COST(f0);
+        s1 += COST(f1);
+        s2 += COST(f2);
+        s3 += COST(f3);
+        s4 += COST(f4);
+#undef COST
     }
-    sdata[threadIdx.x] = local_sum;
+
+    // -------------------------------------------------------------------------
+    // Block-wide reduction of the 5 per-thread partial scores
+    // -------------------------------------------------------------------------
+    __shared__ uint32_t sdata[5][256];
+    sdata[0][threadIdx.x] = s0;
+    sdata[1][threadIdx.x] = s1;
+    sdata[2][threadIdx.x] = s2;
+    sdata[3][threadIdx.x] = s3;
+    sdata[4][threadIdx.x] = s4;
     __syncthreads();
 
-    // Tree reduction – explicit to avoid any __syncthreads inside unrolled warp
-    if (threadIdx.x < 128) sdata[threadIdx.x] += sdata[threadIdx.x + 128]; __syncthreads();
-    if (threadIdx.x <  64) sdata[threadIdx.x] += sdata[threadIdx.x +  64]; __syncthreads();
-    if (threadIdx.x <  32) sdata[threadIdx.x] += sdata[threadIdx.x +  32]; __syncthreads();
-    if (threadIdx.x <  16) sdata[threadIdx.x] += sdata[threadIdx.x +  16]; __syncthreads();
-    if (threadIdx.x <   8) sdata[threadIdx.x] += sdata[threadIdx.x +   8]; __syncthreads();
-    if (threadIdx.x <   4) sdata[threadIdx.x] += sdata[threadIdx.x +   4]; __syncthreads();
-    if (threadIdx.x <   2) sdata[threadIdx.x] += sdata[threadIdx.x +   2]; __syncthreads();
-    if (threadIdx.x <   1) sdata[threadIdx.x] += sdata[threadIdx.x +   1]; __syncthreads();
+#define REDUCE_STEP(half)                                               \
+    if (threadIdx.x < (half)) {                                         \
+        sdata[0][threadIdx.x] += sdata[0][threadIdx.x + (half)];       \
+        sdata[1][threadIdx.x] += sdata[1][threadIdx.x + (half)];       \
+        sdata[2][threadIdx.x] += sdata[2][threadIdx.x + (half)];       \
+        sdata[3][threadIdx.x] += sdata[3][threadIdx.x + (half)];       \
+        sdata[4][threadIdx.x] += sdata[4][threadIdx.x + (half)];       \
+    } __syncthreads();
 
-    if (threadIdx.x == 0)
-        d_scores[filter_id * strip_height + row_idx] = sdata[0];
-}
+    REDUCE_STEP(128)
+    REDUCE_STEP( 64)
+    REDUCE_STEP( 32)
+    REDUCE_STEP( 16)
+    REDUCE_STEP(  8)
+    REDUCE_STEP(  4)
+    REDUCE_STEP(  2)
+    REDUCE_STEP(  1)
+#undef REDUCE_STEP
 
-// ---------------------------------------------------------------------------
-// Kernel 3 – select_assemble_kernel
-//
-// Grid : (actual_rows, 1, 1)
-// Block: (256, 1, 1)
-//
-// Picks the minimum-score filter per row then parallel-copies the selected
-// filtered row + filter byte into d_selected.
-// ---------------------------------------------------------------------------
-__global__ void select_assemble_kernel(
-    const uint8_t*  __restrict__ d_filtered,
-    const uint32_t* __restrict__ d_scores,
-    uint8_t*                     d_selected,
-    int                          width_bytes,
-    int                          strip_height,
-    int                          actual_rows)
-{
-    const int row_idx = blockIdx.x;
-    if (row_idx >= actual_rows) return;
-
+    // Thread 0 picks the minimum-score filter and writes the filter-type byte
     __shared__ int s_best;
-
-    // Thread 0 performs the 5-way minimum
     if (threadIdx.x == 0) {
-        int    best  = 0;
-        uint32_t bsc = d_scores[row_idx];  // filter 0
-        for (int f = 1; f < 5; f++) {
-            uint32_t s = d_scores[f * strip_height + row_idx];
-            if (s < bsc) { bsc = s; best = f; }
-        }
+        int      best = 0;
+        uint32_t bsc  = sdata[0][0];
+        if (sdata[1][0] < bsc) { bsc = sdata[1][0]; best = 1; }
+        if (sdata[2][0] < bsc) { bsc = sdata[2][0]; best = 2; }
+        if (sdata[3][0] < bsc) { bsc = sdata[3][0]; best = 3; }
+        if (sdata[4][0] < bsc) {                    best = 4; }
         s_best = best;
-        // Write filter-type byte at head of output row
-        d_selected[row_idx * (width_bytes + 1)] = (uint8_t)best;
+        d_selected[row * (width_bytes + 1)] = (uint8_t)best;
     }
     __syncthreads();
 
     const int best_f = s_best;
-    const uint8_t* src = d_filtered + best_f * strip_height * width_bytes
-                                    + row_idx * width_bytes;
-    uint8_t*       dst = d_selected + row_idx * (width_bytes + 1) + 1;
+    uint8_t* dst = d_selected + row * (width_bytes + 1) + 1;
 
-    for (int i = threadIdx.x; i < width_bytes; i += blockDim.x)
-        dst[i] = src[i];
+    // -------------------------------------------------------------------------
+    // Pass 2: recompute and write the winning filtered row
+    // -------------------------------------------------------------------------
+    for (int i = threadIdx.x; i < width_bytes; i += blockDim.x) {
+        const uint8_t x = d_input[(size_t)row * width_bytes + i];
+        const uint8_t a = (i >= bpp) ? d_input[(size_t)row * width_bytes + i - bpp] : 0;
+        const uint8_t b = prev_in[i];
+
+        uint8_t out_val;
+        if (best_f == 0) {
+            out_val = x;
+        } else if (best_f == 1) {
+            out_val = x - a;
+        } else if (best_f == 2) {
+            out_val = x - b;
+        } else if (best_f == 3) {
+            out_val = x - (uint8_t)(((uint16_t)a + (uint16_t)b) >> 1);
+        } else {
+            const uint8_t c = (i >= bpp) ? prev_in[i - bpp] : 0;
+            const int pv = (int)a + (int)b - (int)c;
+            const int pa = abs(pv - (int)a);
+            const int pb = abs(pv - (int)b);
+            const int pc = abs(pv - (int)c);
+            out_val = x - ((pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c));
+        }
+        dst[i] = out_val;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -220,13 +320,10 @@ GpuFilterContext* gpu_filter_create(int width, int bpp, int strip_height)
     ctx->width_bytes  = width * bpp;
 
     const size_t strip_bytes = (size_t)strip_height * ctx->width_bytes;
+    const size_t out_bytes   = (size_t)strip_height * (ctx->width_bytes + 1);
 
     CHECK_CUDA(cudaMalloc(&ctx->d_input,    strip_bytes));
     CHECK_CUDA(cudaMalloc(&ctx->d_prior,    ctx->width_bytes));
-    CHECK_CUDA(cudaMalloc(&ctx->d_filtered, 5 * strip_bytes));
-    CHECK_CUDA(cudaMalloc(&ctx->d_scores,   5 * strip_height * sizeof(uint32_t)));
-
-    const size_t out_bytes = (size_t)strip_height * (ctx->width_bytes + 1);
     CHECK_CUDA(cudaMalloc(&ctx->d_selected, out_bytes));
     CHECK_CUDA(cudaMallocHost(&ctx->h_output, out_bytes));
 
@@ -234,7 +331,6 @@ GpuFilterContext* gpu_filter_create(int width, int bpp, int strip_height)
     CHECK_CUDA(cudaMemset(ctx->d_prior, 0, ctx->width_bytes));
 
     CHECK_CUDA(cudaStreamCreate(&ctx->stream));
-
     CHECK_CUDA(cudaEventCreate(&ctx->ev_start));
     CHECK_CUDA(cudaEventCreate(&ctx->ev_h2d_done));
     CHECK_CUDA(cudaEventCreate(&ctx->ev_kernels_done));
@@ -248,8 +344,6 @@ void gpu_filter_destroy(GpuFilterContext* ctx)
     if (!ctx) return;
     cudaFree(ctx->d_input);
     cudaFree(ctx->d_prior);
-    cudaFree(ctx->d_filtered);
-    cudaFree(ctx->d_scores);
     cudaFree(ctx->d_selected);
     cudaFreeHost(ctx->h_output);
     cudaEventDestroy(ctx->ev_start);
@@ -266,117 +360,15 @@ size_t gpu_filter_output_size(const GpuFilterContext* ctx, int actual_rows)
 }
 
 // ---------------------------------------------------------------------------
-// DICOM pixel preprocessing kernel
-//
-// Runs in-place on d_input before the PNG filter kernels.
-// Transforms raw little-endian DICOM samples to big-endian PNG-ready samples:
-//   1. bit-depth normalisation  (shift away unused high bits)
-//   2. signed → unsigned offset binary (if pixel_rep == 1)
-//   3. rescale slope / intercept
-//   4. window / level clamp
-//   5. byte-swap to big-endian (16-bit only)
-//
-// One thread handles one sample (one colour channel of one pixel).
-// Grid: ceil(total_samples / 256) × 1   Block: 256 × 1
-// ---------------------------------------------------------------------------
-// In-place kernel: reads and writes the same buffer (d_inout).
-// NOT __restrict__ on d_inout because d_in and d_out are the same pointer;
-// using __restrict__ on an aliased pointer is undefined behaviour.
-__global__ void dicom_preprocess_kernel(
-    uint8_t*     d_inout,
-    int          total_samples,
-    DicomPixelParams p)
-{
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= total_samples) return;
-
-    // Local aliases for clarity; all reads must precede writes for this thread.
-    const uint8_t* d_in  = d_inout;
-    uint8_t*       d_out = d_inout;
-
-    const int out_maxval = (p.bits_allocated == 16) ? 65535 : 255;
-    float val;
-
-    if (p.bits_allocated == 16) {
-        // Read DICOM native (little-endian) 16-bit sample
-        uint16_t raw = (uint16_t)d_in[idx * 2]
-                     | ((uint16_t)d_in[idx * 2 + 1] << 8);
-
-        // Right-align: shift = HighBit − BitsStored + 1
-        //   Right-aligned (common): HighBit = BitsStored-1 → shift = 0
-        //   Left-aligned  (rare):   HighBit = BitsAllocated-1 → shift = BitsAllocated-BitsStored
-        int bit_shift = p.high_bit - p.bits_stored + 1;
-        if (bit_shift > 0) raw = (uint16_t)(raw >> bit_shift);
-
-        // Mask to exactly bits_stored bits (defensive: DICOM spec requires unused bits = 0
-        // but real-world files occasionally have garbage in the padding bits)
-        if (p.bits_stored < 16) {
-            uint32_t mask = (1u << p.bits_stored) - 1u;
-            raw = (uint16_t)(raw & (uint16_t)mask);
-        }
-
-        if (p.pixel_rep == 1) {
-            // Two's complement sign extension, then apply rescale to the signed value.
-            // Rescale slope/intercept in DICOM always applies to the raw signed integer,
-            // NOT to an unsigned-shifted representation.
-            int32_t sv;
-            if (p.bits_stored == 16) {
-                sv = (int32_t)(int16_t)raw;
-            } else {
-                int bits = p.bits_stored;
-                int half = 1 << (bits - 1);
-                sv = (int32_t)(raw);
-                if (sv >= half) sv -= (1 << bits);  // two's complement → signed int
-            }
-            // Apply rescale to signed value, then shift to unsigned for window/output
-            if (p.apply_rescale)
-                val = (float)sv * p.rescale_slope + p.rescale_intercept;
-            else
-                val = (float)sv;
-        } else {
-            // Unsigned: rescale applies directly to the unsigned integer
-            val = (float)raw;
-            if (p.apply_rescale)
-                val = val * p.rescale_slope + p.rescale_intercept;
-        }
-    } else {
-        // 8-bit: single unsigned byte per sample
-        val = (float)d_in[idx];
-        if (p.apply_rescale)
-            val = val * p.rescale_slope + p.rescale_intercept;
-    }
-
-    if (p.apply_window) {
-        float lo = p.window_center - p.window_width * 0.5f;
-        val = (val - lo) / p.window_width * (float)out_maxval;
-    }
-
-    val = fmaxf(0.f, fminf((float)out_maxval, val));
-    uint32_t ov = (uint32_t)val;
-
-    if (p.bits_allocated == 16) {
-        // Write big-endian (PNG / network byte order)
-        d_out[idx * 2]     = (uint8_t)(ov >> 8);
-        d_out[idx * 2 + 1] = (uint8_t)(ov & 0xFF);
-    } else {
-        d_out[idx] = (uint8_t)ov;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Internal: run kernels, DMA result to pinned host memory, fill timings.
-// ev_h2d_done must already be recorded by the caller.
+// Internal: launch kernels, DMA result to pinned host, fill timings
 // ---------------------------------------------------------------------------
 static const uint8_t* run_kernels(GpuFilterContext* ctx, int actual_rows,
                                    GpuTimings* timings, const DicomPixelParams* dicom)
 {
-    const int W  = ctx->width_bytes;
-    const int SH = ctx->strip_height;
+    const int W = ctx->width_bytes;
 
-    // Optional DICOM pixel preprocessing (in-place on d_input)
-    // Must run before multi_filter_kernel; stream ordering guarantees sequencing.
+    // Optional DICOM preprocessing (in-place on d_input, must precede filter kernel)
     if (dicom) {
-        // total_samples = number of individual colour-channel values in the strip
         int total_samples = actual_rows * W / (dicom->bits_allocated / 8);
         dim3 dblk(256);
         dim3 dgrd((total_samples + 255) / 256);
@@ -384,33 +376,16 @@ static const uint8_t* run_kernels(GpuFilterContext* ctx, int actual_rows,
             ctx->d_input, total_samples, *dicom);
     }
 
-    // Kernel 1 – multi_filter
-    {
-        dim3 block(256, 1, 1);
-        dim3 grid((W + 255) / 256, actual_rows, 1);
-        multi_filter_kernel<<<grid, block, 0, ctx->stream>>>(
-            ctx->d_input, ctx->d_prior, ctx->d_filtered,
-            W, ctx->bpp, SH, actual_rows);
-    }
-
-    // Kernel 2 – row_score  (one block per (row, filter) pair)
-    {
-        dim3 block(256, 1, 1);
-        dim3 grid(actual_rows, 5, 1);
-        row_score_kernel<<<grid, block, 0, ctx->stream>>>(
-            ctx->d_filtered, ctx->d_scores, W, SH, actual_rows);
-    }
-
-    // Kernel 3 – select + assemble
+    // Fused filter + select: one block per row
     {
         dim3 block(256, 1, 1);
         dim3 grid(actual_rows, 1, 1);
-        select_assemble_kernel<<<grid, block, 0, ctx->stream>>>(
-            ctx->d_filtered, ctx->d_scores, ctx->d_selected,
-            W, SH, actual_rows);
+        filter_select_kernel<<<grid, block, 0, ctx->stream>>>(
+            ctx->d_input, ctx->d_prior, ctx->d_selected,
+            W, ctx->bpp, actual_rows);
     }
 
-    // Save the last row of this strip as the prior row for the next strip
+    // Save last row of d_input (preprocessed, BE) as prior row for the next strip
     CHECK_CUDA(cudaMemcpyAsync(
         ctx->d_prior,
         ctx->d_input + (size_t)(actual_rows - 1) * W,
@@ -418,10 +393,8 @@ static const uint8_t* run_kernels(GpuFilterContext* ctx, int actual_rows,
         cudaMemcpyDeviceToDevice,
         ctx->stream));
 
-    // Mark end of kernel phase
     CHECK_CUDA(cudaEventRecord(ctx->ev_kernels_done, ctx->stream));
 
-    // DMA result to pinned host buffer
     const size_t out_bytes = gpu_filter_output_size(ctx, actual_rows);
     CHECK_CUDA(cudaMemcpyAsync(
         ctx->h_output, ctx->d_selected,
@@ -429,13 +402,9 @@ static const uint8_t* run_kernels(GpuFilterContext* ctx, int actual_rows,
         cudaMemcpyDeviceToHost,
         ctx->stream));
 
-    // Mark end of D2H phase
     CHECK_CUDA(cudaEventRecord(ctx->ev_d2h_done, ctx->stream));
-
-    // Synchronise – caller receives valid data immediately on return
     CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
 
-    // Fill timing breakdown if requested
     if (timings) {
         cudaEventElapsedTime(&timings->h2d_ms,    ctx->ev_start,        ctx->ev_h2d_done);
         cudaEventElapsedTime(&timings->kernel_ms, ctx->ev_h2d_done,     ctx->ev_kernels_done);

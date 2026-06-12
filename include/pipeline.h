@@ -2,7 +2,7 @@
 #include <cstdint>
 
 struct PipelineConfig {
-    int  strip_height     = 64;   // rows per GPU strip
+    int  strip_height     = 256;  // rows per GPU strip
     int  deflate_threads  = 6;    // CPU threads for parallel DEFLATE
     int  deflate_level    = 3;    // zlib level (1=fast, 9=best ratio)
     bool verbose          = false;
