@@ -1,184 +1,160 @@
 # RAW2PNG-ConversionThruGPU
 
-GPU-accelerated image conversion pipeline for converting **DICOM**, **TIFF**, and **Camera RAW** images into PNG using CUDA-based image processing and **zlib-ng powered DEFLATE compression**.
+**GPU-accelerated DICOM, TIFF, and Camera RAW to PNG conversion pipeline built with CUDA and zlib-ng.**
 
-The project is designed to maximize throughput by overlapping image loading, GPU filtering, compression, and PNG writing through a concurrent pipeline architecture optimized for low-latency image conversion.
+This project converts high-resolution medical and photographic images into PNG using a hybrid CPU/GPU architecture that combines:
+
+- CUDA-based image processing
+- Strip-based streaming
+- Parallel DEFLATE compression
+- Concurrent producer-consumer pipelines
+- PNG generation with custom IDAT stream construction
+
+The design prioritizes **throughput**, **low memory usage**, and **scalability for large images**.
 
 ---
 
-## Features
+## Supported Formats
 
-* CUDA-accelerated image preprocessing
-* Supports DICOM, TIFF, and Camera RAW formats
-* High-performance **zlib-ng** compression backend
-* Compression Level 0 support for maximum encoding speed
-* Strip-based image processing for low memory usage
-* Concurrent producer-consumer pipeline
-* JPEG, JPEG-LS, JPEG2000, and RLE DICOM support
-* OpenJPEG integration for JPEG2000 decoding
-* Manual PNG generation with custom IDAT stream handling
-* Performance profiling for GPU transfers and processing stages
+### Input
+
+#### DICOM
+
+- `.dcm`
+- `.dicom`
+- `.dic`
+- `.ima`
+- Files containing DICOM magic (`DICM`) at byte offset 128
+
+#### TIFF
+
+- `.tif`
+- `.tiff`
+
+#### Camera RAW
+
+- `.cr2`
+- `.nef`
+- `.dng`
+- `.arw`
+- `.raf`
+- `.orf`
+- `.rw2`
+- `.raw`
+
+### Output
+
+- PNG (`.png`)
+
+---
+
+## Key Features
+
+### CUDA Image Processing
+
+GPU-accelerated operations include:
+
+- Pixel normalization
+- Window/Level transformations
+- Rescale slope/intercept application
+- Bit-depth conversion
+- PNG scanline preparation
+
+### Advanced DICOM Support
+
+Supported transfer syntaxes:
+
+- Implicit VR Little Endian
+- Explicit VR Little Endian
+- JPEG Baseline
+- JPEG Lossless
+- JPEG-LS Lossless
+- JPEG-LS Near Lossless
+- JPEG 2000
+- JPEG 2000 Lossless
+- RLE Lossless
+
+### Parallel Compression
+
+- Persistent worker thread pool
+- Chunk-based compression
+- Thread-local z_stream reuse
+- Adler-32 accumulation and combination
+- Compatible with zlib-ng
+
+### Multi-Frame DICOM Export
+
+- Single frame export
+- Specific frame export via `--frame`
+- Entire volume export via `--all`
 
 ---
 
 ## Architecture
 
 ```text
-Input Image
-      │
-      ▼
-┌─────────────┐
-│ Loader      │
-└─────────────┘
-      │
-      ▼
- Queue A
-      │
-      ▼
-┌─────────────┐
-│ GPU Filter  │
-│ CUDA        │
-└─────────────┘
-      │
-      ▼
- Queue B
-      │
-      ▼
-┌─────────────┐
-│ zlib-ng     │
-│ Compression │
-└─────────────┘
-      │
-      ▼
- Queue C
-      │
-      ▼
-┌─────────────┐
-│ PNG Writer  │
-└─────────────┘
-      │
-      ▼
-    PNG
+Image Input
+    │
+    ▼
+Loader Thread
+    │
+    ▼
+Queue A
+    │
+    ▼
+CUDA Processing
+    │
+    ▼
+Queue B
+    │
+    ▼
+DEFLATE Thread Pool
+    │
+    ▼
+Queue C
+    │
+    ▼
+PNG Writer
+    │
+    ▼
+PNG Output
 ```
 
 ---
 
-## DICOM Support
+## Compression Backend
 
-Supported transfer syntaxes:
+This project uses **zlib-ng** through the zlib compatibility API.
 
-* Implicit VR Little Endian
-* Explicit VR Little Endian
-* JPEG Baseline
-* JPEG Lossless
-* JPEG-LS Lossless
-* JPEG-LS Near Lossless
-* JPEG 2000 Lossless
-* JPEG 2000
-* RLE Lossless
-
-The pipeline performs:
-
-* Pixel extraction
-* Rescale slope/intercept application
-* Window/level transformation
-* Bit-depth normalization
-* PNG preparation
-
-before compression and encoding.
-
----
-
-## GPU Processing
-
-CUDA kernels accelerate:
-
-* Pixel preprocessing
-* DICOM transformations
-* PNG scanline filtering
-
-Performance metrics can be collected for:
-
-* Host → Device transfer
-* Kernel execution
-* Device → Host transfer
-
----
-
-## zlib-ng Compression
-
-This project uses **zlib-ng**, a modern and optimized implementation of the DEFLATE algorithm with support for advanced CPU instruction sets such as:
-
-* AVX2
-* AVX-512
-* SSE4.2
-* ARM NEON
-
-### Current Configuration
+### Current Defaults
 
 ```cpp
-Threads = 1
-Compression Level = 0
+Threads = 6
+Compression Level = 3
+Strip Height = 256
 ```
 
-### Why Compression Level 0?
+### Optimization Techniques
 
-The primary goal of this project is **minimum image conversion time**.
-
-Compression Level 0:
-
-* Disables expensive DEFLATE searching
-* Minimizes CPU overhead
-* Reduces PNG encoding latency
-* Maximizes conversion throughput
-
-This configuration is particularly useful for:
-
-* Medical imaging workflows
-* High-volume batch conversions
-* GPU-focused performance benchmarking
-* Real-time image processing pipelines
+- Raw DEFLATE (`windowBits = -15`)
+- `Z_FULL_FLUSH` between intermediate chunks
+- Single final `Z_FINISH`
+- Thread-local compressor reuse
+- Parallel chunk scheduling
 
 ---
 
-## PNG Generation
+## Build Requirements
 
-```text
-Image Data
-    │
-    ▼
-PNG Filters
-    │
-    ▼
-zlib-ng DEFLATE
-    │
-    ▼
-IDAT Chunks
-    │
-    ▼
-PNG File
-```
-
-The encoder manually constructs PNG chunks to provide complete control over:
-
-* Compression strategy
-* Memory usage
-* Pipeline scheduling
-* Performance optimization
-
----
-
-## Dependencies
-
-* CUDA Toolkit 11.8+
-* DCMTK
-* OpenJPEG
-* zlib-ng
-* libpng
-* libraw
-* libtiff
-* CMake 3.18+
-* C++17
+- CUDA Toolkit 11.8+
+- DCMTK
+- OpenJPEG
+- zlib-ng
+- libpng
+- LibRaw
+- libtiff
+- CMake 3.18+
+- C++17
 
 ---
 
@@ -200,47 +176,57 @@ cmake --build build --config Release
 gpu_png_encoder input.dcm output.png
 ```
 
-### Options
+### Examples
 
 ```bash
-gpu_png_encoder input.dcm output.png --strip-height 128
-gpu_png_encoder input.dcm output.png --threads 1
+gpu_png_encoder study.dcm output_folder --all
+gpu_png_encoder input.dcm output.png --frame 12
+gpu_png_encoder input.dcm output.png --threads 8
 gpu_png_encoder input.dcm output.png --level 0
 gpu_png_encoder input.dcm output.png --verbose
 ```
 
-| Option           | Description                          |
-| ---------------- | ------------------------------------ |
-| --strip-height N | Rows processed per GPU strip         |
-| --threads N      | Number of compression worker threads |
-| --level N        | Compression level (0–9)              |
-| --verbose        | Print performance metrics            |
+---
+
+## DEFLATE Benchmark
+
+```bash
+gpu_png_encoder --bench-deflate
+```
 
 ---
 
-## Performance-Oriented Design
+## Project Structure
 
-The project focuses on minimizing end-to-end conversion time through:
+```text
+include/
+src/
+CMakeLists.txt
+vcpkg.json
+README.md
+```
 
-* GPU-accelerated pixel processing
-* zlib-ng optimized compression
-* Compression Level 0 encoding
-* Strip-based streaming
-* Bounded memory queues
-* Concurrent pipeline execution
-* Low-overhead PNG generation
+---
+
+## Performance Goals
+
+- High throughput
+- Efficient CPU/GPU utilization
+- Low memory consumption
+- Fast PNG generation
+- Scalable processing for large medical datasets
 
 ---
 
 ## Future Improvements
 
-* Pinned-memory GPU transfers
-* Asynchronous CUDA streams
-* Multi-GPU support
-* Batch DICOM conversion
-* GPU-based PNG filtering
-* SIMD-aware PNG filter optimization
-* End-to-end performance benchmarking suite
+- Pinned host memory
+- CUDA streams
+- Multi-GPU support
+- GPU PNG filtering
+- Batch processing mode
+- Benchmark dashboard
+- PACS integration
 
 ---
 
