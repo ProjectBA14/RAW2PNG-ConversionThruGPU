@@ -1,249 +1,268 @@
 # RAW2PNG-ConversionThruGPU
 
-GPU-accelerated image conversion pipeline for converting **DICOM**, **TIFF**, and **Camera RAW** images into PNG using CUDA-based image processing and **zlib-ng powered DEFLATE compression**.
+GPU-accelerated image conversion pipeline for converting **DICOM**, **TIFF**, and **Camera RAW** images into PNG using CUDA-based image processing and a high-performance **zlib-ng** compression backend.
 
-The project is designed to maximize throughput by overlapping image loading, GPU filtering, compression, and PNG writing through a concurrent pipeline architecture optimized for low-latency image conversion.
+The project overlaps image loading, GPU preprocessing, compression, and PNG writing through a concurrent pipeline architecture designed for high-throughput image conversion.
 
 ---
 
-## Features
+# Features
 
 * CUDA-accelerated image preprocessing
 * Supports DICOM, TIFF, and Camera RAW formats
-* High-performance **zlib-ng** compression backend
-* Compression Level 0 support for maximum encoding speed
-* Strip-based image processing for low memory usage
-* Concurrent producer-consumer pipeline
-* JPEG, JPEG-LS, JPEG2000, and RLE DICOM support
-* OpenJPEG integration for JPEG2000 decoding
-* Manual PNG generation with custom IDAT stream handling
-* Performance profiling for GPU transfers and processing stages
+* JPEG, JPEG-LS, JPEG2000 and RLE DICOM decoding
+* OpenJPEG integration
+* zlib-ng accelerated DEFLATE compression
+* Manual PNG generation
+* Strip-based GPU processing
+* Multi-threaded producer-consumer pipeline
+* Performance benchmarking utilities
+* Supports both legacy (GT710) and modern NVIDIA GPUs
 
 ---
 
-## Architecture
+# Project Structure
 
 ```text
-Input Image
-      │
-      ▼
-┌─────────────┐
-│ Loader      │
-└─────────────┘
-      │
-      ▼
- Queue A
-      │
-      ▼
-┌─────────────┐
-│ GPU Filter  │
-│ CUDA        │
-└─────────────┘
-      │
-      ▼
- Queue B
-      │
-      ▼
-┌─────────────┐
-│ zlib-ng     │
-│ Compression │
-└─────────────┘
-      │
-      ▼
- Queue C
-      │
-      ▼
-┌─────────────┐
-│ PNG Writer  │
-└─────────────┘
-      │
-      ▼
-    PNG
+.
+├── benchmarks/         Benchmark reports and graphs
+├── include/            Header files
+├── src/                Source files
+├── data/               Sample data
+├── CMakeLists.txt
+└── README.md
 ```
 
 ---
 
-## DICOM Support
+# Requirements
 
-Supported transfer syntaxes:
+## Operating System
 
-* Implicit VR Little Endian
-* Explicit VR Little Endian
-* JPEG Baseline
-* JPEG Lossless
-* JPEG-LS Lossless
-* JPEG-LS Near Lossless
-* JPEG 2000 Lossless
-* JPEG 2000
-* RLE Lossless
-
-The pipeline performs:
-
-* Pixel extraction
-* Rescale slope/intercept application
-* Window/level transformation
-* Bit-depth normalization
-* PNG preparation
-
-before compression and encoding.
+* Windows 10/11
+* Linux (tested with recent Ubuntu releases)
 
 ---
 
-## GPU Processing
+## Compiler
 
-CUDA kernels accelerate:
-
-* Pixel preprocessing
-* DICOM transformations
-* PNG scanline filtering
-
-Performance metrics can be collected for:
-
-* Host → Device transfer
-* Kernel execution
-* Device → Host transfer
+* C++17 compatible compiler
+* MSVC 2022
+* GCC 11+
+* Clang 14+
 
 ---
 
-## zlib-ng Compression
+## CMake
 
-This project uses **zlib-ng**, a modern and optimized implementation of the DEFLATE algorithm with support for advanced CPU instruction sets such as:
+Minimum version:
 
-* AVX2
-* AVX-512
-* SSE4.2
-* ARM NEON
-
-### Current Configuration
-
-```cpp
-Threads = 1
-Compression Level = 0
+```
+3.18
 ```
 
-### Why Compression Level 0?
+For modern GPU builds (automatic architecture detection):
 
-The primary goal of this project is **minimum image conversion time**.
-
-Compression Level 0:
-
-* Disables expensive DEFLATE searching
-* Minimizes CPU overhead
-* Reduces PNG encoding latency
-* Maximizes conversion throughput
-
-This configuration is particularly useful for:
-
-* Medical imaging workflows
-* High-volume batch conversions
-* GPU-focused performance benchmarking
-* Real-time image processing pipelines
-
----
-
-## PNG Generation
-
-```text
-Image Data
-    │
-    ▼
-PNG Filters
-    │
-    ▼
-zlib-ng DEFLATE
-    │
-    ▼
-IDAT Chunks
-    │
-    ▼
-PNG File
+```
+3.24 or newer
 ```
 
-The encoder manually constructs PNG chunks to provide complete control over:
+---
 
-* Compression strategy
-* Memory usage
-* Pipeline scheduling
-* Performance optimization
+# CUDA Requirements
+
+## Legacy GPU (GT710)
+
+* CUDA Toolkit **11.8**
+* Compute Capability **3.5**
+
+Build using:
+
+```bash
+cmake -B build -DLEGACY_GPU=ON
+```
 
 ---
 
-## Dependencies
+## Modern GPUs (RTX Series)
 
-* CUDA Toolkit 11.8+
-* DCMTK
-* OpenJPEG
-* zlib-ng
-* libpng
-* libraw
-* libtiff
-* CMake 3.18+
-* C++17
+* CUDA Toolkit 12.x or newer
+* Recommended CUDA 13.x
+* CMake 3.24+
+
+Build using:
+
+```bash
+cmake -B build
+```
 
 ---
 
-## Build
+# Required Libraries
+
+The following libraries must be installed before building.
+
+| Library                           | Purpose                 |
+| --------------------------------- | ----------------------- |
+| CUDA Toolkit                      | GPU acceleration        |
+| zlib-ng (zlib compatibility mode) | PNG compression         |
+| libpng                            | PNG writing             |
+| libtiff                           | TIFF image loading      |
+| LibRaw                            | Camera RAW decoding     |
+| DCMTK                             | DICOM parsing           |
+| OpenJPEG                          | JPEG2000 DICOM decoding |
+
+---
+
+# Installing Dependencies
+
+## Using vcpkg (Recommended)
+
+Install the required libraries:
+
+```bash
+vcpkg install libpng
+vcpkg install libtiff
+vcpkg install libraw
+vcpkg install dcmtk
+vcpkg install openjpeg
+vcpkg install zlib-ng[core,zlib-compat]
+```
+
+If using CMake with vcpkg:
+
+```bash
+cmake -B build ^
+    -DCMAKE_TOOLCHAIN_FILE=<vcpkg-root>/scripts/buildsystems/vcpkg.cmake
+```
+
+Replace `<vcpkg-root>` with your local vcpkg installation path.
+
+---
+
+# Building
+
+Clone the repository:
 
 ```bash
 git clone https://github.com/ProjectBA14/RAW2PNG-ConversionThruGPU.git
-cd RAW2PNG-ConversionThruGPU
 
+cd RAW2PNG-ConversionThruGPU
+```
+
+## Modern GPU Build
+
+```bash
 cmake -B build
+
 cmake --build build --config Release
 ```
 
 ---
 
-## Usage
+## GT710 / Legacy Build
 
 ```bash
-gpu_png_encoder input.dcm output.png
+cmake -B build -DLEGACY_GPU=ON
+
+cmake --build build --config Release
 ```
 
-### Options
+---
+
+# Running
+
+After compilation, execute:
 
 ```bash
-gpu_png_encoder input.dcm output.png --strip-height 128
-gpu_png_encoder input.dcm output.png --threads 1
-gpu_png_encoder input.dcm output.png --level 0
-gpu_png_encoder input.dcm output.png --verbose
+gpu_png_encoder input_image output.png
 ```
 
-| Option           | Description                          |
-| ---------------- | ------------------------------------ |
-| --strip-height N | Rows processed per GPU strip         |
-| --threads N      | Number of compression worker threads |
-| --level N        | Compression level (0–9)              |
-| --verbose        | Print performance metrics            |
+Example:
+
+```bash
+gpu_png_encoder sample.dcm output.png
+```
 
 ---
 
-## Performance-Oriented Design
+# Command Line Options
 
-The project focuses on minimizing end-to-end conversion time through:
+| Option             | Description                            |
+| ------------------ | -------------------------------------- |
+| `--strip-height N` | Number of rows processed per GPU strip |
+| `--threads N`      | Number of compression worker threads   |
+| `--level N`        | PNG compression level (0–9)            |
+| `--verbose`        | Print timing and pipeline statistics   |
 
-* GPU-accelerated pixel processing
-* zlib-ng optimized compression
-* Compression Level 0 encoding
-* Strip-based streaming
-* Bounded memory queues
-* Concurrent pipeline execution
-* Low-overhead PNG generation
+Example:
 
----
-
-## Future Improvements
-
-* Pinned-memory GPU transfers
-* Asynchronous CUDA streams
-* Multi-GPU support
-* Batch DICOM conversion
-* GPU-based PNG filtering
-* SIMD-aware PNG filter optimization
-* End-to-end performance benchmarking suite
+```bash
+gpu_png_encoder image.dcm output.png --strip-height 128 --threads 4 --level 0 --verbose
+```
 
 ---
 
-## License
+# Supported Input Formats
 
-This project is intended for research, learning, and high-performance image processing experimentation.
+* DICOM (.dcm)
+* TIFF (.tif/.tiff)
+* Camera RAW (CR2, NEF, ARW, DNG, etc.)
+
+---
+
+# DICOM Features
+
+Supported Transfer Syntaxes:
+
+* Implicit VR Little Endian
+* Explicit VR Little Endian
+* JPEG Baseline
+* JPEG Lossless
+* JPEG-LS
+* JPEG2000
+* JPEG2000 Lossless
+* RLE Lossless
+
+The processing pipeline automatically performs:
+
+* Pixel extraction
+* Rescale Slope / Intercept
+* Window Width / Level
+* Bit-depth normalization
+* PNG scanline filtering
+
+---
+
+# Performance
+
+The pipeline records timing information for:
+
+* Image loading
+* Host → Device transfer
+* CUDA kernel execution
+* Device → Host transfer
+* Compression
+* PNG writing
+* Total conversion time
+
+Benchmark reports are available under:
+
+```text
+benchmarks/
+```
+
+---
+
+# Notes
+
+* **Compression Level 0** is recommended for maximum throughput.
+* **zlib-ng** is used in **zlib compatibility mode**, making it a drop-in replacement for zlib while providing significantly better performance.
+* Modern GPUs automatically enable the optimized CUDA pipeline.
+* Legacy GPUs fall back to a compatible processing pipeline while preserving functionality.
+
+---
+
+# License
+
+This project is intended for academic research and performance evaluation.
